@@ -1,0 +1,77 @@
+name: flutter-upgrade
+
+on:
+  workflow_call:
+    inputs:
+      fvmrc-path:
+        description: Path to the .fvmrc JSON file holding the pinned flutter version
+        type: string
+        default: app/.fvmrc
+      ci-workflow:
+        description: Caller workflow file to dispatch on the PR branch (skipped if empty)
+        type: string
+        default: ""
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open upgrade PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FVMRC: ${{ inputs.fvmrc-path }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+        run: |
+          set -euo pipefail
+
+          latest=$(curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json |
+            jq -r '.current_release.stable as $h | first(.releases[] | select(.hash == $h) | .version)')
+          current=$(jq -r .flutter "$FVMRC")
+          echo "current=$current latest=$latest"
+          [ -n "$latest" ] || { echo "could not resolve latest stable" >&2; exit 1; }
+
+          if [ "$current" = "$latest" ]; then
+            echo "Flutter is already at $latest"
+            exit 0
+          fi
+
+          branch="chore/upgrade-flutter-$latest"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Branch $branch already exists on origin; nothing to do"
+            exit 0
+          fi
+
+          # Targeted edit keeps the file's formatting (and missing trailing newline).
+          CURRENT="$current" LATEST="$latest" perl -pi -e \
+            's/("flutter"\s*:\s*")\Q$ENV{CURRENT}\E"/$1$ENV{LATEST}"/' "$FVMRC"
+          [ "$(jq -r .flutter "$FVMRC")" = "$latest" ] || { echo "failed to rewrite $FVMRC" >&2; exit 1; }
+
+          base=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "build: upgrade flutter to $latest"
+          git push origin "$branch"
+
+          gh pr create --base "$base" --head "$branch" \
+            --title "build: upgrade flutter to $latest" \
+            --body "$(cat <<BODY
+          Opened by the scheduled flutter-upgrade workflow.
+
+          Flutter: \`$current\` → \`$latest\` (\`$FVMRC\`)
+
+          - [ ] Run \`flutter pub get\` locally and commit any \`pubspec.lock\` / generated-file changes
+          - [ ] Check tracked iOS \`Package.resolved\` with \`xcodebuild -resolvePackageDependencies -disableAutomaticPackageResolution\` (Xcode Cloud disables automatic resolution)
+          - [ ] \`just release\`
+          BODY
+          )"
+
+          if [ -n "$CI_WORKFLOW" ]; then
+            gh workflow run "$CI_WORKFLOW" --ref "$branch"
+          fi
